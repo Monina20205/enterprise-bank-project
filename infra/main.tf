@@ -57,7 +57,7 @@ module "aks_cluster" {
   project_name = var.project_name
   location     = "eastus2"
   node_count   = var.node_count
-  acr_id       = "" 
+  acr_id       = ""
 }
 
 # 3. Asignación de Roles (RESOLUCIÓN DEL ERROR)
