@@ -1,17 +1,96 @@
+name: Enterprise DevSecOps Pipeline
 
-name: Enterprise Pipeline
-on: [push]
+on:
+  push:
+    branches: [ "develop", "release/*", "main" ]
+  workflow_dispatch:
+
+env:
+  ENV_NAME: ${{ github.ref == 'refs/heads/main' && 'prod' || (startsWith(github.ref, 'refs/heads/release') && 'stage' || 'dev') }}
+  PROJECT_NAME: "enterprisebank"
+  APP_SOURCE_DIR: "src/payments-service"
+
 jobs:
-  build:
+  # 1. SEGURIDAD DE CÓDIGO (Snyk)
+  security-code-scan:
+    name: 🛡️ Snyk Code Scan
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        env: [dev, prod]
     steps:
       - uses: actions/checkout@v3
-      
-      - name: Scan Code
-        run: echo "Running Snyk..."
-        
-      - name: Terraform
-        run: echo "Running Terraform for ${{ matrix.env }}"
+      - name: Run Snyk
+        uses: snyk/actions/maven@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high
+
+  # 2. INFRAESTRUCTURA (Terraform)
+  provision-infra:
+    name: 🏗️ Terraform Provision
+    runs-on: ubuntu-latest
+    outputs:
+      acr_name: ${{ steps.get_acr.outputs.acr_name }}
+    steps:
+      - uses: actions/checkout@v3
+      - uses: hashicorp/setup-terraform@v2
+      - name: Terraform Init & Apply
+        env:
+          ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+          ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+        run: |
+          cd infra
+          terraform init
+          terraform apply -var-file="envs/${{ env.ENV_NAME }}.tfvars" -auto-approve
+      - name: Get ACR Name
+        id: get_acr
+        run: |
+          az login --service-principal -u ${{ secrets.ARM_CLIENT_ID }} -p ${{ secrets.ARM_CLIENT_SECRET }} --tenant ${{ secrets.ARM_TENANT_ID }}
+          ACR_NAME=$(az acr list -g rg-${{ env.PROJECT_NAME }}-global --query "[0].name" -o tsv)
+          echo "acr_name=$ACR_NAME" >> $GITHUB_OUTPUT
+
+  # 3. BUILD & SCAN (Docker + Trivy)
+  build-and-scan:
+    name: 🐳 Build & Scan
+    needs: [provision-infra]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Docker Login
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ needs.provision-infra.outputs.acr_name }}.azurecr.io
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+      - name: Build Image
+        run: docker build -t ${{ needs.provision-infra.outputs.acr_name }}.azurecr.io/java-app:${{ github.sha }} ${{ env.APP_SOURCE_DIR }}
+      - name: Trivy Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ needs.provision-infra.outputs.acr_name }}.azurecr.io/java-app:${{ github.sha }}'
+          format: 'table'
+          exit-code: '0'
+          severity: 'CRITICAL,HIGH'
+      - name: Push Image
+        run: docker push ${{ needs.provision-infra.outputs.acr_name }}.azurecr.io/java-app:${{ github.sha }}
+
+  # 4. DESPLIEGUE (Kubernetes)
+  deploy:
+    name: 🚀 Deploy to AKS
+    needs: [provision-infra, build-and-scan]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Get AKS Credentials
+        run: az aks get-credentials -g rg-${{ env.PROJECT_NAME }}-${{ env.ENV_NAME }} -n aks-${{ env.PROJECT_NAME }}-${{ env.ENV_NAME }} --overwrite-existing
+      - name: Deploy App
+        run: |
+          kubectl create deployment java-app --image=${{ needs.provision-infra.outputs.acr_name }}.azurecr.io/java-app:${{ github.sha }} --dry-run=client -o yaml | kubectl apply -f -
+          kubectl create service loadbalancer java-app --tcp=80:8080 --dry-run=client -o yaml | kubectl apply -f -
+          kubectl set image deployment/java-app java-app=${{ needs.provision-infra.outputs.acr_name }}.azurecr.io/java-app:${{ github.sha }}
