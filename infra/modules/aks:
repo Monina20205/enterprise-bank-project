@@ -1,0 +1,64 @@
+# infra/modules/aks/main.tf
+
+# 1. Grupo de Recursos (Uno por entorno: rg-dev, rg-prod, etc.)
+resource "azurerm_resource_group" "rg" {
+  name     = "rg-${var.project_name}-${var.env}"
+  location = var.location
+  tags = {
+    Environment = var.env
+    ManagedBy   = "Terraform"
+  }
+}
+
+# 2. Identidad Gestionada (Para que el AKS tenga permisos seguros)
+resource "azurerm_user_assigned_identity" "aks_identity" {
+  name                = "id-aks-${var.env}"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+}
+
+# 3. Clúster de Kubernetes (AKS)
+resource "azurerm_kubernetes_cluster" "aks" {
+  name                = "aks-${var.project_name}-${var.env}"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+  dns_prefix          = "aks-${var.env}"
+  
+  # Usamos SKU 'Standard' para prod y 'Free' para dev/stage para ahorrar
+  sku_tier            = var.env == "prod" ? "Standard" : "Free"
+
+  default_node_pool {
+    name       = "default"
+    node_count = var.node_count
+    vm_size    = var.vm_size
+    
+    # Auto-escalado solo para producción
+    enable_auto_scaling = var.env == "prod" ? true : false
+    min_count           = var.env == "prod" ? 1 : null
+    max_count           = var.env == "prod" ? 5 : null
+  }
+
+  identity {
+    type         = "UserAssigned"
+    identity_ids = [azurerm_user_assigned_identity.aks_identity.id]
+  }
+
+  network_profile {
+    network_plugin    = "azure"
+    load_balancer_sku = "standard"
+  }
+
+  tags = {
+    Environment = var.env
+  }
+}
+
+# 4. Rol para que el AKS pueda "leer" del Container Registry (ACR)
+# Nota: Esto asume que pasamos el ID del ACR como variable
+resource "azurerm_role_assignment" "acr_pull" {
+  count                            = var.acr_id != "" ? 1 : 0
+  principal_id                     = azurerm_kubernetes_cluster.aks.kubelet_identity[0].object_id
+  role_definition_name             = "AcrPull"
+  scope                            = var.acr_id
+  skip_service_principal_aad_check = true
+}

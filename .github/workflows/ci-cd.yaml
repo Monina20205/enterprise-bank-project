@@ -1,0 +1,17 @@
+
+name: Enterprise Pipeline
+on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        env: [dev, prod]
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Scan Code
+        run: echo "Running Snyk..."
+        
+      - name: Terraform
+        run: echo "Running Terraform for ${{ matrix.env }}"

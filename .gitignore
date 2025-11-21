@@ -1,0 +1,17 @@
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfvars
+.terraform.lock.hcl
+
+# Java
+target/
+*.class
+*.jar
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+.DS_Store
